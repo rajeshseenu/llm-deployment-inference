@@ -23,8 +23,10 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_URL="${REPO_URL:-https://github.com/rajeshseenu/llm-deployment-inference.git}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
 BUILD_DIR="$(mktemp -d /tmp/llm-chat-install.XXXXXX)"
+SCRIPT_DIR=""   # set by clone_repo(), used by every build/render step below
 
 ok()   { echo "✅ $1"; }
 warn() { echo "⚠️  $1"; }
@@ -32,6 +34,18 @@ fail() { echo "❌ $1"; exit 1; }
 step() { echo ""; echo "==> $1"; }
 
 trap 'rm -rf "${BUILD_DIR}"' EXIT
+
+# ------------------------------------------------------------------------------
+# 0. Clone this repo into a throwaway temp dir — makes the script runnable
+#    standalone via: curl -sSL <raw-url>/install.sh | bash
+# ------------------------------------------------------------------------------
+clone_repo() {
+  step "Fetching repo: ${REPO_URL}"
+  local clone_dir="${BUILD_DIR}/repo"
+  git clone --depth 1 --branch "${REPO_BRANCH}" "${REPO_URL}" "${clone_dir}" \
+    && ok "Repo cloned" || fail "git clone failed — check REPO_URL and network"
+  SCRIPT_DIR="${clone_dir}"
+}
 
 # ------------------------------------------------------------------------------
 # 1. Preflight checks
@@ -345,6 +359,7 @@ print_summary() {
 # ------------------------------------------------------------------------------
 main() {
   preflight
+  clone_repo
   install_k3s
   collect_inputs
   registry_login
