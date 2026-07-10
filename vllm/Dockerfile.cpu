@@ -1,0 +1,41 @@
+# ==============================================================================
+# Dockerfile.cpu — CPU-only vLLM image. No GPU/CUDA required.
+# Requires: HF_MODEL_ID build-arg, optional HF_TOKEN build secret for gated models.
+# ==============================================================================
+
+FROM python:3.11-slim AS fetch
+
+ARG HF_MODEL_ID
+ENV HF_MODEL_ID=${HF_MODEL_ID}
+ENV HF_HOME=/model_cache
+
+RUN pip install --no-cache-dir "huggingface_hub[cli]"
+
+RUN --mount=type=secret,id=hf_token \
+    export HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)" && \
+    if [ -z "${HF_MODEL_ID}" ]; then \
+      echo "ERROR: HF_MODEL_ID build-arg is empty. Pass --build-arg HF_MODEL_ID=<repo/model>" && exit 1; \
+    fi && \
+    hf download "${HF_MODEL_ID}" \
+      --local-dir /model \
+      ${HF_TOKEN:+--token "${HF_TOKEN}"}
+
+# Community-maintained CPU build of vLLM — auto-detects AVX2/AVX512/AMX/etc at runtime.
+FROM mekayelanik/vllm-cpu:latest
+
+ARG HF_MODEL_ID
+LABEL model.id="${HF_MODEL_ID}" \
+      org.opencontainers.image.description="CPU-only model image for ACR"
+
+COPY --from=fetch /model /model
+
+RUN echo "{\"hf_model_id\": \"${HF_MODEL_ID}\", \"path\": \"/model\", \"backend\": \"cpu\"}" > /model/manifest.json
+
+ENV MODEL_PATH=/model
+
+# This image's own ENTRYPOINT already wraps `vllm serve` — CMD appends args
+# rather than replacing the entrypoint (do NOT use ENTRYPOINT here).
+# --enforce-eager and TORCHDYNAMO_DISABLE (set at deploy time, see
+# k8s/10-vllm-deployment.yaml.tpl) together avoid a torch.compile C++ build
+# failure seen on this image's PyTorch install.
+CMD ["--model", "/model", "--dtype", "auto", "--enforce-eager"]

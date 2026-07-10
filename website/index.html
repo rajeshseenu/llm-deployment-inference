@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>LLM Chat</title>
+  <style>
+    body { font-family: sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; }
+    #chat { border: 1px solid #ccc; border-radius: 8px; padding: 16px; min-height: 300px; margin-bottom: 12px; }
+    .msg { margin: 8px 0; }
+    .user { color: #1a73e8; }
+    .bot { color: #333; }
+    input { width: 80%; padding: 8px; }
+    button { padding: 8px 16px; }
+  </style>
+</head>
+<body>
+  <h2>LLM Chat</h2>
+  <div id="chat"></div>
+  <input id="prompt" type="text" placeholder="Type a message..." />
+  <button onclick="send()">Send</button>
+  <script src="app.js"></script>
+</body>
+</html>

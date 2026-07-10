@@ -1,0 +1,10 @@
+# Never commit these, even by accident
+*.env
+.env
+*.token
+credentials*
+secrets*
+*.log
+__pycache__/
+.DS_Store
+*.tgz
