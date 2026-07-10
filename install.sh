@@ -133,37 +133,50 @@ collect_inputs() {
   HF_MODEL_ID="${HF_MODEL_ID:-Qwen/Qwen2.5-0.5B-Instruct}"
   read -rsp "Hugging Face token (blank if model is public): " HF_TOKEN < /dev/tty; echo "" < /dev/tty
 
-  read -rp "Image repository path for the model image [base-models/qwen2.5-0.5b-instruct]: " VLLM_IMAGE_PATH < /dev/tty
-  VLLM_IMAGE_PATH="${VLLM_IMAGE_PATH:-base-models/qwen2.5-0.5b-instruct}"
-  read -rp "Image tag for the model image [cpu-v3]: " VLLM_IMAGE_TAG < /dev/tty
-  VLLM_IMAGE_TAG="${VLLM_IMAGE_TAG:-cpu-v3}"
+  # Single combined image:tag prompt instead of two separate prompts each
+  read -rp "Model image name:tag (e.g. base-models/qwen2.5-0.5b-instruct:cpu-v3) [base-models/qwen2.5-0.5b-instruct:cpu-v3]: " VLLM_IMAGE_REF < /dev/tty
+  VLLM_IMAGE_REF="${VLLM_IMAGE_REF:-base-models/qwen2.5-0.5b-instruct:cpu-v3}"
 
-  read -rp "Image repository path for the website [base-models/chat-website]: " WEBSITE_IMAGE_PATH < /dev/tty
-  WEBSITE_IMAGE_PATH="${WEBSITE_IMAGE_PATH:-base-models/chat-website}"
-  read -rp "Image tag for the website [v1]: " WEBSITE_IMAGE_TAG < /dev/tty
-  WEBSITE_IMAGE_TAG="${WEBSITE_IMAGE_TAG:-v1}"
+  read -rp "Website image name:tag (e.g. base-models/chat-website:v1) [base-models/chat-website:v1]: " WEBSITE_IMAGE_REF < /dev/tty
+  WEBSITE_IMAGE_REF="${WEBSITE_IMAGE_REF:-base-models/chat-website:v1}"
 
   read -rp "Kubernetes namespace [llm-demo]: " K8S_NAMESPACE < /dev/tty
   K8S_NAMESPACE="${K8S_NAMESPACE:-llm-demo}"
 
-  read -rp "ACR pull secret name [acr-secret]: " ACR_SECRET_NAME < /dev/tty
-  ACR_SECRET_NAME="${ACR_SECRET_NAME:-acr-secret}"
+  # ACR pull secret name is no longer asked — generated automatically.
+  ACR_SECRET_NAME="acr-secret"
 
-  read -rp "vLLM CPU request [2]: " VLLM_CPU_REQUEST < /dev/tty
-  VLLM_CPU_REQUEST="${VLLM_CPU_REQUEST:-2}"
-  read -rp "vLLM CPU limit [4]: " VLLM_CPU_LIMIT < /dev/tty
-  VLLM_CPU_LIMIT="${VLLM_CPU_LIMIT:-4}"
-  read -rp "vLLM memory request [5Gi]: " VLLM_MEM_REQUEST < /dev/tty
-  VLLM_MEM_REQUEST="${VLLM_MEM_REQUEST:-5Gi}"
-  read -rp "vLLM memory limit [9Gi]: " VLLM_MEM_LIMIT < /dev/tty
-  VLLM_MEM_LIMIT="${VLLM_MEM_LIMIT:-9Gi}"
-  read -rp "vLLM KV cache size in GB [2]: " VLLM_KVCACHE_GB < /dev/tty
-  VLLM_KVCACHE_GB="${VLLM_KVCACHE_GB:-2}"
+  echo ""
+  echo "Resource sizing for the vLLM pod:"
+  echo "  1) Use defaults (2 vCPU request / 4 vCPU limit, 5Gi/9Gi memory, 2GB KV cache)"
+  echo "  2) Customize"
+  read -rp "Enter 1 or 2 [1]: " RESOURCE_CHOICE < /dev/tty
+  RESOURCE_CHOICE="${RESOURCE_CHOICE:-1}"
+
+  if [[ "${RESOURCE_CHOICE}" == "2" ]]; then
+    read -rp "vLLM CPU request [2]: " VLLM_CPU_REQUEST < /dev/tty
+    VLLM_CPU_REQUEST="${VLLM_CPU_REQUEST:-2}"
+    read -rp "vLLM CPU limit [4]: " VLLM_CPU_LIMIT < /dev/tty
+    VLLM_CPU_LIMIT="${VLLM_CPU_LIMIT:-4}"
+    read -rp "vLLM memory request [5Gi]: " VLLM_MEM_REQUEST < /dev/tty
+    VLLM_MEM_REQUEST="${VLLM_MEM_REQUEST:-5Gi}"
+    read -rp "vLLM memory limit [9Gi]: " VLLM_MEM_LIMIT < /dev/tty
+    VLLM_MEM_LIMIT="${VLLM_MEM_LIMIT:-9Gi}"
+    read -rp "vLLM KV cache size in GB [2]: " VLLM_KVCACHE_GB < /dev/tty
+    VLLM_KVCACHE_GB="${VLLM_KVCACHE_GB:-2}"
+  else
+    VLLM_CPU_REQUEST="2"
+    VLLM_CPU_LIMIT="4"
+    VLLM_MEM_REQUEST="5Gi"
+    VLLM_MEM_LIMIT="9Gi"
+    VLLM_KVCACHE_GB="2"
+    ok "Using default resource sizing"
+  fi
 
   read -rp "Domain name for Ingress (leave blank to use node IP): " DOMAIN_NAME < /dev/tty
 
-  VLLM_IMAGE="${REGISTRY}/${VLLM_IMAGE_PATH}:${VLLM_IMAGE_TAG}"
-  WEBSITE_IMAGE="${REGISTRY}/${WEBSITE_IMAGE_PATH}:${WEBSITE_IMAGE_TAG}"
+  VLLM_IMAGE="${REGISTRY}/${VLLM_IMAGE_REF}"
+  WEBSITE_IMAGE="${REGISTRY}/${WEBSITE_IMAGE_REF}"
 
   export REGISTRY REGISTRY_USER REGISTRY_PASS HF_MODEL_ID HF_TOKEN
   export VLLM_IMAGE WEBSITE_IMAGE K8S_NAMESPACE ACR_SECRET_NAME
