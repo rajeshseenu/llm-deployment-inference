@@ -129,17 +129,14 @@ collect_inputs() {
   read -rp "Registry username: " REGISTRY_USER < /dev/tty
   read -rsp "Registry password: " REGISTRY_PASS < /dev/tty; echo "" < /dev/tty
 
-  while true; do
-    read -rp "Hugging Face model ID (e.g. Qwen/Qwen2.5-0.5B-Instruct): " HF_MODEL_ID < /dev/tty
-    [[ -n "${HF_MODEL_ID}" ]] && break
-    echo "  Cannot be empty."
-  done
+  read -rp "Hugging Face model ID [Qwen/Qwen2.5-0.5B-Instruct]: " HF_MODEL_ID < /dev/tty
+  HF_MODEL_ID="${HF_MODEL_ID:-Qwen/Qwen2.5-0.5B-Instruct}"
   read -rsp "Hugging Face token (blank if model is public): " HF_TOKEN < /dev/tty; echo "" < /dev/tty
 
-  read -rp "Image repository path for the model image [base-models/llm]: " VLLM_IMAGE_PATH < /dev/tty
-  VLLM_IMAGE_PATH="${VLLM_IMAGE_PATH:-base-models/llm}"
-  read -rp "Image tag for the model image [cpu-v1]: " VLLM_IMAGE_TAG < /dev/tty
-  VLLM_IMAGE_TAG="${VLLM_IMAGE_TAG:-cpu-v1}"
+  read -rp "Image repository path for the model image [base-models/qwen2.5-0.5b-instruct]: " VLLM_IMAGE_PATH < /dev/tty
+  VLLM_IMAGE_PATH="${VLLM_IMAGE_PATH:-base-models/qwen2.5-0.5b-instruct}"
+  read -rp "Image tag for the model image [cpu-v3]: " VLLM_IMAGE_TAG < /dev/tty
+  VLLM_IMAGE_TAG="${VLLM_IMAGE_TAG:-cpu-v3}"
 
   read -rp "Image repository path for the website [base-models/chat-website]: " WEBSITE_IMAGE_PATH < /dev/tty
   WEBSITE_IMAGE_PATH="${WEBSITE_IMAGE_PATH:-base-models/chat-website}"
@@ -228,10 +225,18 @@ install_argocd() {
     ok "ArgoCD namespace already exists — skipping install"
     return
   fi
-  kubectl create namespace argocd
-  kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-  kubectl -n argocd rollout status deploy/argocd-server --timeout=180s \
-    && ok "ArgoCD installed" || warn "ArgoCD install had issues — continuing, this doesn't block the deployment"
+  kubectl create namespace argocd || true
+
+  # --server-side avoids kubectl's client-side "last-applied-configuration"
+  # annotation, which is too large for some ArgoCD CRDs (ApplicationSet) and
+  # otherwise causes a hard failure here.
+  if kubectl apply -n argocd --server-side --force-conflicts \
+       -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml; then
+    kubectl -n argocd rollout status deploy/argocd-server --timeout=180s \
+      && ok "ArgoCD installed" || warn "ArgoCD server not ready yet — continuing, this doesn't block the deployment"
+  else
+    warn "ArgoCD install had errors — continuing anyway, since it's optional and not required for this deployment"
+  fi
 }
 
 # ------------------------------------------------------------------------------
