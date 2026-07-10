@@ -2,9 +2,9 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: chat-website
-  namespace: ${K8S_NAMESPACE}
+  namespace: {{ .Values.namespace }}
 spec:
-  replicas: 1
+  replicas: {{ .Values.website.replicas }}
   selector:
     matchLabels:
       app: chat-website
@@ -14,10 +14,10 @@ spec:
         app: chat-website
     spec:
       imagePullSecrets:
-        - name: ${ACR_SECRET_NAME}
+        - name: {{ .Values.imagePullSecret.name }}
       containers:
         - name: website
-          image: "${WEBSITE_IMAGE}"
+          image: "{{ .Values.website.image }}"
           ports:
             - containerPort: 80
 ---
@@ -25,7 +25,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: chat-website-service
-  namespace: ${K8S_NAMESPACE}
+  namespace: {{ .Values.namespace }}
 spec:
   selector:
     app: chat-website

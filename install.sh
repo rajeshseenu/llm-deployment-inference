@@ -25,6 +25,7 @@ set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/rajeshseenu/llm-deployment-inference.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
+export REPO_URL REPO_BRANCH
 BUILD_DIR="$(mktemp -d /tmp/llm-chat-install.XXXXXX)"
 SCRIPT_DIR=""   # set by clone_repo(), used by every build/render step below
 
@@ -90,6 +91,22 @@ preflight() {
     warn "envsubst not found — installing (gettext-base)..."
     sudo apt-get update -qq && sudo apt-get install -y -qq gettext-base \
       && ok "envsubst installed" || fail "envsubst installation failed"
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    ok "python3 installed"
+  else
+    warn "python3 not found — installing..."
+    sudo apt-get update -qq && sudo apt-get install -y -qq python3 \
+      && ok "python3 installed" || fail "python3 installation failed"
+  fi
+
+  if command -v helm >/dev/null 2>&1; then
+    ok "helm installed ($(helm version --short 2>/dev/null))"
+  else
+    warn "helm not found — installing..."
+    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash \
+      && ok "helm installed" || fail "helm installation failed"
   fi
 
   if curl -fsS --max-time 5 https://github.com >/dev/null 2>&1; then
@@ -269,74 +286,104 @@ create_namespace_and_secret() {
 }
 
 # ------------------------------------------------------------------------------
-# 9. Render + apply manifests
+# 9. Update values.yaml locally, then package + push the Helm chart to ACR as
+#    an OCI artifact. This is the only place values.yaml is edited — this
+#    repo's git copy is left untouched; the chart in ACR is what ArgoCD reads.
 # ------------------------------------------------------------------------------
-apply_manifests() {
-  step "Rendering and applying Kubernetes manifests"
-  local rendered_dir="${BUILD_DIR}/k8s"
-  mkdir -p "${rendered_dir}"
+package_and_push_chart() {
+  step "Preparing Helm chart"
+  local chart_src="${SCRIPT_DIR}/helm/llm-chat-stack"
+  local chart_build="${BUILD_DIR}/chart/llm-chat-stack"
+  mkdir -p "$(dirname "${chart_build}")"
+  cp -r "${chart_src}" "${chart_build}"
 
-  for tpl in "${SCRIPT_DIR}"/k8s/*.yaml.tpl; do
-    local out
-    out="${rendered_dir}/$(basename "${tpl}" .tpl)"
-    envsubst < "${tpl}" > "${out}"
-  done
+  local values_file="${chart_build}/values.yaml"
+  local vllm_repo="${VLLM_IMAGE%:*}"
+  local vllm_tag="${VLLM_IMAGE##*:}"
 
-  kubectl apply -f "${rendered_dir}/namespace.yaml" \
-    && kubectl apply -f "${rendered_dir}/vllmdeployment.yaml" \
-    && kubectl apply -f "${rendered_dir}/websitedeployment.yaml" \
-    && ok "Manifests applied" || fail "Applying manifests failed"
+  python3 - "$values_file" "$K8S_NAMESPACE" "$vllm_repo" "$vllm_tag" "$VLLM_KVCACHE_GB" \
+    "$VLLM_CPU_REQUEST" "$VLLM_CPU_LIMIT" "$VLLM_MEM_REQUEST" "$VLLM_MEM_LIMIT" \
+    "$WEBSITE_IMAGE" "$ACR_SECRET_NAME" "$DOMAIN_NAME" << 'PYEOF'
+import sys, re
+path, ns, vrepo, vtag, kv, cpureq, cpulim, memreq, memlim, website_img, secret, host = sys.argv[1:13]
+with open(path) as f:
+    content = f.read()
+content = re.sub(r'namespace: .*', f'namespace: {ns}', content, count=1)
+content = re.sub(r'repository: .*azurecr\.io/base-models/qwen.*', f'repository: {vrepo}', content, count=1)
+content = re.sub(r'(\n  tag: ).*', rf'\g<1>{vtag}', content, count=1)
+content = re.sub(r'kvCacheSpaceGB: .*', f'kvCacheSpaceGB: {kv}', content, count=1)
+content = re.sub(r'(requests:\n      cpu: ").*(")', rf'\g<1>{cpureq}\g<2>', content, count=1)
+content = re.sub(r'(limits:\n      cpu: ").*(")', rf'\g<1>{cpulim}\g<2>', content, count=1)
+content = re.sub(r'(requests:\n      cpu: "[^"]*"\n      memory: ").*(")', rf'\g<1>{memreq}\g<2>', content, count=1)
+content = re.sub(r'(limits:\n      cpu: "[^"]*"\n      memory: ").*(")', rf'\g<1>{memlim}\g<2>', content, count=1)
+content = re.sub(r'(website:\n  image: ).*', rf'\g<1>{website_img}', content, count=1)
+content = re.sub(r'(name: ).*(   # created directly)', rf'\g<1>{secret}\g<2>', content, count=1)
+content = re.sub(r'(host: )".*"', rf'\g<1>"{host}"', content, count=1)
+with open(path, 'w') as f:
+    f.write(content)
+PYEOF
+  ok "values.yaml prepared with your inputs"
+
+  # Version each push uniquely — OCI charts are immutable per version, so a
+  # timestamp guarantees this install (and any later manual push) never
+  # collides with a previous one.
+  CHART_VERSION="0.1.$(date +%s)"
+  sed -i "s/^version: .*/version: ${CHART_VERSION}/" "${chart_build}/Chart.yaml"
+  export CHART_VERSION
+
+  step "Packaging chart version ${CHART_VERSION}"
+  helm package "${chart_build}" -d "${BUILD_DIR}" && ok "Chart packaged" || fail "helm package failed"
+
+  step "Pushing chart to ${REGISTRY}/helm"
+  helm registry login "${REGISTRY}" --username "${REGISTRY_USER}" --password "${REGISTRY_PASS}" \
+    && ok "Logged into ${REGISTRY} for Helm" || fail "Helm registry login failed"
+
+  helm push "${BUILD_DIR}/llm-chat-stack-${CHART_VERSION}.tgz" "oci://${REGISTRY}/helm" \
+    && ok "Pushed chart ${CHART_VERSION} to oci://${REGISTRY}/helm" || fail "helm push failed"
 }
 
 # ------------------------------------------------------------------------------
-# 10. Ingress
+# 10. Give ArgoCD OCI registry credentials, then deploy the Application.
+#     targetRevision uses a semver wildcard ("*") — any later chart version
+#     you push to ACR is picked up automatically without touching this
+#     Application again.
 # ------------------------------------------------------------------------------
-create_ingress() {
-  step "Ingress"
-  local ingress_file="${BUILD_DIR}/ingress.yaml"
-
-  if [[ -n "${DOMAIN_NAME}" ]]; then
-    cat > "${ingress_file}" << EOF
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+deploy_argocd_application() {
+  step "Configuring ArgoCD's access to the OCI Helm registry"
+  kubectl -n argocd delete secret acr-helm-repo --ignore-not-found=true >/dev/null 2>&1
+  kubectl apply -f - << EOF
+apiVersion: v1
+kind: Secret
 metadata:
-  name: chat-website-ingress
-  namespace: ${K8S_NAMESPACE}
-spec:
-  rules:
-    - host: ${DOMAIN_NAME}
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: chat-website-service
-                port:
-                  number: 80
+  name: acr-helm-repo
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: repository
+stringData:
+  type: helm
+  name: acr-helm
+  url: ${REGISTRY}/helm
+  enableOCI: "true"
+  username: ${REGISTRY_USER}
+  password: ${REGISTRY_PASS}
 EOF
-  else
-    cat > "${ingress_file}" << EOF
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: chat-website-ingress
-  namespace: ${K8S_NAMESPACE}
-spec:
-  rules:
-    - http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: chat-website-service
-                port:
-                  number: 80
-EOF
-  fi
+  ok "ArgoCD OCI repo credentials configured"
 
-  kubectl apply -f "${ingress_file}" && ok "Ingress created" || fail "Ingress creation failed"
+  step "Deploying ArgoCD Application"
+  local app_file="${BUILD_DIR}/application.yaml"
+  export K8S_NAMESPACE
+  envsubst '${REGISTRY} ${K8S_NAMESPACE}' \
+    < "${SCRIPT_DIR}/argocd/application.yaml.tpl" > "${app_file}"
+
+  kubectl apply -f "${app_file}" && ok "ArgoCD Application created" || fail "Failed to create ArgoCD Application"
+
+  sleep 3
+  kubectl -n argocd patch application llm-chat-stack --type merge \
+    -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}' >/dev/null 2>&1 || true
+  sleep 3
+  kubectl -n argocd patch application llm-chat-stack --type merge \
+    -p '{"operation":{"sync":{}}}' >/dev/null 2>&1 || true
+  ok "Sync triggered"
 }
 
 # ------------------------------------------------------------------------------
@@ -385,8 +432,8 @@ main() {
   build_website_image
   install_argocd
   create_namespace_and_secret
-  apply_manifests
-  create_ingress
+  package_and_push_chart
+  deploy_argocd_application
   wait_for_vllm
   print_summary
 }

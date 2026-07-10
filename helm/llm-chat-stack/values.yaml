@@ -1,0 +1,34 @@
+# Non-secret configuration only. Registry credentials and HF tokens are NEVER
+# stored here — they're supplied at install time and used to create a
+# Kubernetes Secret directly (see install.sh), referenced by name below.
+#
+# To deploy a new model version or image build: edit vllm.image below,
+# commit, and push. ArgoCD (watching this repo) detects the change and
+# rolls out the new image automatically — no manual kubectl needed.
+
+namespace: llm-demo
+
+vllm:
+  image:
+    repository: uipathaksoffline.azurecr.io/base-models/qwen2.5-0.5b-instruct
+    tag: cpu-v3
+  port: 8000
+  kvCacheSpaceGB: 2
+  resources:
+    requests:
+      cpu: "2"
+      memory: "5Gi"
+    limits:
+      cpu: "4"
+      memory: "9Gi"
+
+imagePullSecret:
+  name: acr-secret   # created directly via kubectl by install.sh, not managed by this chart
+
+website:
+  image: uipathaksoffline.azurecr.io/base-models/chat-website:v1
+  replicas: 1
+
+ingress:
+  # Leave host blank to access via node IP (no host-based routing rule).
+  host: ""

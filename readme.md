@@ -1,94 +1,97 @@
-# llm-chat-gitops
+# llm-deployment-inference
 
-A reproducible, from-scratch deployment of a CPU-only LLM (vLLM) with a chat
-website frontend, on a single-node k3s cluster. Built from a working,
-hand-validated configuration — every value that differs between environments
-(registry, credentials, model, namespace, domain) is prompted for by
-`install.sh` at runtime. Nothing is hardcoded in this repo.
+A reproducible, GitOps-managed deployment of a CPU-only LLM (vLLM) with a
+chat website frontend, on a single-node k3s cluster. The Helm chart is
+packaged and pushed to ACR as an OCI artifact; ArgoCD watches that same
+registry path with a semver wildcard (`targetRevision: "*"`) — any new
+chart version you push is picked up and deployed automatically.
 
 ## Project structure
 
 ```
-llm-chat-gitops/
-├── install.sh                          # the one script that does everything
+llm-deployment-inference/
+├── install.sh                              # one-time bootstrap — run this first
+├── push-chart.sh                            # package + push a new chart version later
+├── uninstall.sh                             # teardown (app-only or full dependency removal)
 ├── website/
-│   ├── index.html                      # chat UI
-│   ├── app.js                          # calls /v1/chat/completions via same-origin proxy
-│   ├── nginx.conf.tpl                  # proxies /v1/* to vllm-service internally
-│   └── Dockerfile                      # bakes the above into an nginx image
+│   ├── index.html
+│   ├── app.js
+│   ├── nginx.conf.tpl                       # ${K8S_NAMESPACE} substituted at image build time
+│   └── Dockerfile
 ├── vllm/
-│   └── Dockerfile.cpu                  # fetches a HF model, bakes into a CPU vLLM image
-└── k8s/
-    ├── 00-namespace.yaml.tpl
-    ├── 10-vllm-deployment.yaml.tpl      # vLLM Deployment + Service (validated config)
-    └── 20-website-deployment.yaml.tpl   # website Deployment + Service
+│   └── Dockerfile.cpu                       # fetches a HF model, bakes into a CPU vLLM image
+├── helm/llm-chat-stack/
+│   ├── Chart.yaml
+│   ├── values.yaml                          # non-secret config only
+│   └── templates/
+│       ├── namespace.yaml
+│       ├── vllm-deployment.yaml
+│       ├── website-deployment.yaml
+│       └── ingress.yaml
+└── argocd/
+    └── application.yaml.tpl                 # ArgoCD Application, OCI source, targetRevision "*"
 ```
 
-`install.sh` renders every `.tpl` file with `envsubst` using the values you
-provide interactively, builds and pushes both Docker images, applies all
-manifests directly via `kubectl` (not through ArgoCD sync — see note below),
-and generates the Ingress inline based on whether you provide a domain.
+## What `install.sh` does (one-time bootstrap)
 
-## Why manifests are applied directly, not via ArgoCD auto-sync
-
-ArgoCD is installed by this script for optional future GitOps use, but the
-actual deployment does **not** depend on ArgoCD syncing successfully. This is
-deliberate: `selfHeal: true` sync policies will revert any manual `kubectl
-edit`/`patch` you make later (e.g. tuning memory limits or probe timeouts
-after observing real behavior on your hardware) back to whatever's in the
-chart — which caused exactly that problem during initial validation of this
-setup. If you want ArgoCD managing this going forward, point an `Application`
-at this repo's `k8s/` folder only after you're confident the manifests here
-already reflect your real, working configuration.
-
-## Usage
-
-```bash
-curl -sSL https://raw.githubusercontent.com/<you>/<repo>/main/install.sh | bash
-```
-
-Or clone and run locally:
-```bash
-git clone https://github.com/<you>/<repo>.git
-cd <repo>
-./install.sh
-```
-
-You'll be prompted for: container registry URL + credentials, the Hugging
-Face model ID (+ token if gated), image tags, Kubernetes namespace, resource
-requests/limits for the vLLM pod, KV cache size, and optionally a domain name
-for the Ingress (leave blank to access via node IP).
-
-## What the script does, in order
-
-1. Preflight checks — git, curl, sudo access, network reachability
-   (installs git/curl/Docker automatically if missing; does not proceed on
-   unfixable gaps like missing sudo)
+1. Preflight checks — installs git, curl, Docker, envsubst, python3, helm if missing
 2. Installs k3s (skipped if already present)
-3. Prompts for all environment-specific values
-4. Logs into the container registry
-5. Builds + pushes the vLLM model image
-6. Builds + pushes the website image
-7. Installs ArgoCD (for optional future use — not required for this deploy)
-8. Creates the namespace and registry pull secret
-9. Renders and applies all Kubernetes manifests
-10. Creates the Ingress (with or without a host rule, based on your input)
-11. Waits for the vLLM pod to become ready (can take several minutes — CPU
-    model warmup is genuinely slow, this is expected, not a hang)
-12. Prints the URL to access the chat UI
+3. Prompts for registry, model, image tags, namespace, resource sizing, domain
+4. Builds + pushes the vLLM and website Docker images to ACR
+5. Installs ArgoCD (server-side apply, avoids a known CRD size limit issue)
+6. Creates the namespace and registry pull secret directly via `kubectl`
+   (secrets never touch the Helm chart or git)
+7. Copies the chart locally, fills in your inputs, tags it with a unique
+   timestamp-based version, and pushes it to `oci://<registry>/helm`
+8. Gives ArgoCD credentials for that OCI registry, then deploys the
+   `Application` (targetRevision `*`) and triggers an immediate sync
+9. Waits for vLLM to become ready (several minutes on CPU — expected)
+10. Prints the URL to access the chat UI
 
-## Known constraints baked into this config (from real troubleshooting)
+## Deploying updates after the initial install
 
-- **`TORCHDYNAMO_DISABLE=1`** — required on the CPU vLLM image used here;
-  without it, `torch.compile` attempts a C++ kernel build that fails due to
-  a missing header in this image's PyTorch install.
-- **`strategy: Recreate`** on the vLLM Deployment — a `RollingUpdate` briefly
-  runs two replicas, which can fail to schedule on resource-constrained
-  single-node clusters (`Insufficient cpu`).
+```bash
+vim helm/llm-chat-stack/values.yaml   # e.g. bump vllm.image.tag
+./push-chart.sh
+```
+`push-chart.sh` packages the chart with a new version and pushes it to ACR.
+ArgoCD (polling that registry) detects the new version automatically and
+rolls it out — no `kubectl` needed, no need to touch the Application again.
+
+To force an immediate sync instead of waiting for ArgoCD's polling interval:
+```bash
+kubectl -n argocd patch application llm-chat-stack --type merge -p '{"operation":{"sync":{}}}'
+```
+
+## Why secrets stay out of the chart
+
+`values.yaml` only ever contains non-sensitive values (image references,
+resource sizing, namespace, domain). Registry credentials and Hugging Face
+tokens are supplied interactively to `install.sh`/`push-chart.sh` and used
+directly — never stored in the chart or pushed to ACR alongside it. The
+image pull secret (`acr-secret` by default) is created once, directly via
+`kubectl`, and referenced by name in `values.yaml`.
+
+## Known constraints baked into this chart (from real troubleshooting)
+
+- **`TORCHDYNAMO_DISABLE=1`** — required on the CPU vLLM image; without it,
+  `torch.compile` attempts a C++ kernel build that fails due to a missing
+  header in this image's PyTorch install.
+- **`strategy: Recreate`** on the vLLM Deployment — `RollingUpdate` briefly
+  runs two replicas, which fails to schedule on resource-constrained
+  single-node clusters.
 - **`startupProbe` with a 10-minute budget** — CPU inference startup
-  (model load + warmup) has been observed taking 3-5 minutes; a shorter
-  probe budget kills the pod before it ever finishes starting.
-- Memory limits should be sized with real headroom above
-  `checkpoint size + VLLM_CPU_KVCACHE_SPACE` — hitting the limit shortly
-  after warmup completes (OOMKilled) is a common failure mode if this is
-  too tight.
+  (model load + warmup) has been observed taking 3-5 minutes.
+- Memory limits are sized with real headroom above
+  `checkpoint size + VLLM_CPU_KVCACHE_SPACE` to avoid post-warmup OOM kills.
+- ArgoCD's `selfHeal: true` is intentional — the chart in ACR is the single
+  source of truth. Manual `kubectl edit`/`patch` on live resources will be
+  reverted; push a new chart version instead.
+
+## Tearing down
+
+```bash
+curl -sSL https://raw.githubusercontent.com/<you>/<repo>/main/uninstall.sh | bash
+```
+Choose app-only removal (keeps k3s/Docker/git) or full removal (everything,
+for testing `install.sh` from a genuinely clean machine).
